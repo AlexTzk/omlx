@@ -729,7 +729,9 @@ def get_sampling_params(
     req_frequency_penalty: float | None = None,
     req_max_tokens: int | None = None,
     ocr_defaults: dict | None = None,
-) -> tuple[float, float, int, float, float, float, float, int]:
+    req_xtc_probability: float | None = None,
+    req_xtc_threshold: float | None = None,
+) -> tuple[float, float, int, float, float, float, float, int, float, float]:
     """
     Get effective sampling parameters with per-model settings support.
 
@@ -738,7 +740,7 @@ def get_sampling_params(
     - Otherwise: request > model settings > ocr_defaults > global defaults
 
     Returns:
-        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens)
+        tuple of (temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold)
     """
     global_sampling = _server_state.sampling
 
@@ -850,14 +852,21 @@ def get_sampling_params(
         else:
             max_tokens = global_sampling.max_tokens
 
+    # XTC probability: request > default (0.0 = disabled)
+    xtc_probability = req_xtc_probability if req_xtc_probability is not None else 0.0
+
+    # XTC threshold: request > default (0.1 = safe default when probability is set)
+    xtc_threshold = req_xtc_threshold if req_xtc_threshold is not None else 0.1
+
     logger.debug(
         f"Sampling params: temperature={temperature}, top_p={top_p}, top_k={top_k}, "
         f"repetition_penalty={repetition_penalty}, min_p={min_p}, presence_penalty={presence_penalty}, "
-        f"frequency_penalty={frequency_penalty}, max_tokens={max_tokens}"
+        f"frequency_penalty={frequency_penalty}, max_tokens={max_tokens}, "
+        f"xtc_probability={xtc_probability}, xtc_threshold={xtc_threshold}"
         f"{' (forced)' if force else ''}"
         f"{f' (model: {model_id})' if model_id else ''}"
     )
-    return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens
+    return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold
 
 
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
@@ -1705,12 +1714,14 @@ async def create_completion(
     total_prompt_tokens = 0
     total_cached_tokens = 0
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
         req_max_tokens=request.max_tokens,
+        req_xtc_probability=getattr(request, 'xtc_probability', None),
+        req_xtc_threshold=getattr(request, 'xtc_threshold', None),
     )
 
     for i, prompt in enumerate(prompts):
@@ -1726,6 +1737,8 @@ async def create_completion(
                 repetition_penalty=repetition_penalty,
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
+                xtc_probability=xtc_probability,
+                xtc_threshold=xtc_threshold,
                 stop=request.stop,
             ),
         )
@@ -1896,12 +1909,14 @@ async def create_chat_completion(
     validate_context_window(num_prompt_tokens, request.model)
 
     # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
         req_max_tokens=request.max_tokens,
+        req_xtc_probability=getattr(request, 'xtc_probability', None),
+        req_xtc_threshold=getattr(request, 'xtc_threshold', None),
     )
     chat_kwargs = {
         "max_tokens": max_tokens,
@@ -1912,6 +1927,8 @@ async def create_chat_completion(
         "repetition_penalty": repetition_penalty,
         "presence_penalty": presence_penalty,
         "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
     }
 
     # Add thinking budget if applicable
@@ -2279,12 +2296,14 @@ async def stream_completion(
     first_token_time = None
     last_output = None
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_min_p=getattr(request, 'min_p', None),
         req_presence_penalty=getattr(request, 'presence_penalty', None),
         req_frequency_penalty=getattr(request, 'frequency_penalty', None),
         req_max_tokens=request.max_tokens,
+        req_xtc_probability=getattr(request, 'xtc_probability', None),
+        req_xtc_threshold=getattr(request, 'xtc_threshold', None),
     )
     try:
         async for output in engine.stream_generate(
@@ -2297,6 +2316,8 @@ async def stream_completion(
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
+            xtc_probability=xtc_probability,
+            xtc_threshold=xtc_threshold,
             stop=request.stop,
         ):
             if first_token_time is None and output.new_text:
@@ -3017,7 +3038,7 @@ async def create_anthropic_message(
         )
 
     # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = get_sampling_params(
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
         request.temperature, request.top_p, request.model,
         req_max_tokens=request.max_tokens,
     )
@@ -3031,6 +3052,8 @@ async def create_anthropic_message(
         "repetition_penalty": repetition_penalty,
         "presence_penalty": presence_penalty,
         "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
     }
 
     # Add thinking budget if applicable
@@ -3409,7 +3432,7 @@ async def create_response(
     validate_context_window(num_prompt_tokens, request.model)
 
     # Build sampling kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens = (
+    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
         get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
     )
     chat_kwargs = {
@@ -3421,6 +3444,8 @@ async def create_response(
         "repetition_penalty": repetition_penalty,
         "presence_penalty": presence_penalty,
         "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
     }
 
     # Add thinking budget if applicable
