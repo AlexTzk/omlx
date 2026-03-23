@@ -157,6 +157,10 @@ class JANGLoader(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._scheduler_config = scheduler_config
+        self._stream_interval = stream_interval
+        self._enable_thinking = enable_thinking
+        self._model_settings = model_settings
 
         self._model = None
         self._tokenizer = None
