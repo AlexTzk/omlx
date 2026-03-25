@@ -205,6 +205,7 @@ class TestChatPageApiKeyInjection:
                     admin_routes.chat_page(request=mock_request, is_admin=True)
                 )
                 call_args = mock_templates.TemplateResponse.call_args
+                # args: (request, name, context)
                 context = call_args[0][2]
                 assert context["api_key"] == ""
         finally:
@@ -222,6 +223,7 @@ class TestChatPageApiKeyInjection:
                     admin_routes.chat_page(request=mock_request, is_admin=True)
                 )
                 call_args = mock_templates.TemplateResponse.call_args
+                # args: (request, name, context)
                 context = call_args[0][2]
                 assert context["api_key"] == ""
         finally:

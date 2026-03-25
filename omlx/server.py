@@ -211,6 +211,7 @@ class ServerState:
     default_model: Optional[str] = None
     mcp_manager: Optional[object] = None
     mcp_executor: Optional[object] = None
+    oq_manager: Optional[object] = None  # OQManager
     sampling: SamplingDefaults = field(default_factory=SamplingDefaults)
     api_key: Optional[str] = None
     settings_manager: Optional[object] = None  # ModelSettingsManager

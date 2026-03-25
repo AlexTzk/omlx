@@ -9,14 +9,56 @@ with mixed-precision quantization (attention 6-8-bit, experts 2-4-bit).
 from __future__ import annotations
 
 import copy
+import json
 import logging
+from pathlib import Path
 from typing import Any
+
+import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..models.vlm import VLMModelAdapter
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+
+
+class _TokenizerWrapper:
+    """
+    Wrapper for tokenizers that don't have an encode() method.
+
+    Some VLM processors (like Qwen3VLProcessor) return a tokenizer that
+    doesn't have encode() directly. This wrapper delegates to the underlying
+    HF tokenizer's encode method.
+    """
+
+    def __init__(self, tokenizer: Any):
+        self._tokenizer = tokenizer
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate attribute access to the underlying tokenizer
+        return getattr(self._tokenizer, name)
+
+    def encode(self, text: str) -> list[int]:
+        """Encode text to token IDs."""
+        # Try different ways to get encode
+        if hasattr(self._tokenizer, "encode"):
+            return self._tokenizer.encode(text)
+        if hasattr(self._tokenizer, "tokenize"):
+            # Fallback: use tokenize and map to ids
+            tokens = self._tokenizer.tokenize(text)
+            if hasattr(self._tokenizer, "convert_tokens_to_ids"):
+                return self._tokenizer.convert_tokens_to_ids(tokens)
+        # Try calling the tokenizer directly (e.g. HF processors)
+        if callable(self._tokenizer):
+            result = self._tokenizer(text)
+            if isinstance(result, dict) and "input_ids" in result:
+                return list(result["input_ids"])
+        raise TypeError(
+            f"Cannot encode text: tokenizer {type(self._tokenizer).__name__} "
+            f"has no encode(), tokenize(), or __call__ returning input_ids"
+        )
 
 
 class JANGLoader(BaseEngine):
@@ -31,7 +73,6 @@ class JANGLoader(BaseEngine):
 
     Args:
         model_name: HuggingFace model name or local path
-        trust_remote_code: Whether to trust remote code
         scheduler_config: Optional scheduler configuration
         stream_interval: Tokens to batch before streaming (1=every token)
         enable_thinking: Enable thinking mode for reasoning models
@@ -41,18 +82,12 @@ class JANGLoader(BaseEngine):
     def __init__(
         self,
         model_name: str,
-        trust_remote_code: bool = True,
         scheduler_config: Any | None = None,
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
     ):
         self._model_name = model_name
-        self._trust_remote_code = trust_remote_code
-        self._scheduler_config = scheduler_config
-        self._stream_interval = stream_interval
-        self._enable_thinking = enable_thinking
-        self._model_settings = model_settings
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
@@ -62,6 +97,8 @@ class JANGLoader(BaseEngine):
         self._tokenizer = None
         self._engine = None
         self._loaded = False
+
+        self._processor = None
 
     @property
     def model_name(self) -> str:
@@ -107,17 +144,33 @@ class JANGLoader(BaseEngine):
                 model_name=self._model_name,
             )
 
+    def _get_config_dict(self) -> dict:
+        """Get model config as a dict, handling both dict and object configs."""
+        if self._model is None:
+            return {}
+        config = getattr(self._model, 'config', None)
+        if config is None:
+            return {}
+        if isinstance(config, dict):
+            return config
+        # Config is an object — try to extract relevant fields
+        result = {}
+        for attr in ('architectures', 'num_local_experts', 'num_experts',
+                      'n_routed_experts', 'hidden_size', 'model_type',
+                      'text_config'):
+            if hasattr(config, attr):
+                result[attr] = getattr(config, attr)
+        return result
+
     def _detect_nemotron_h(self) -> bool:
         """Check if model is Nemotron-H architecture."""
         if self._model is None:
             return False
         try:
-            config = getattr(self._model, 'config', {})
-            if isinstance(config, dict):
-                arch = config.get('architectures', [])
-                for a in arch:
-                    if 'Nemotron' in a:
-                        return True
+            config = self._get_config_dict()
+            for a in config.get('architectures', []):
+                if 'Nemotron' in a:
+                    return True
             return False
         except Exception:
             return False
@@ -127,114 +180,336 @@ class JANGLoader(BaseEngine):
         if self._model is None:
             return False
         try:
-            config = getattr(self._model, 'config', {})
-            if isinstance(config, dict):
-                n_experts = config.get('num_local_experts', 0)
-                hidden_size = config.get('hidden_size', 0)
-                if n_experts >= 512 and hidden_size >= 4096:
-                    return True
-            # Try other config locations
-            if hasattr(self._model, 'config'):
-                cfg = self._model.config
-                if hasattr(cfg, 'num_local_experts'):
-                    if cfg.num_local_experts >= 512:
-                        if hasattr(cfg, 'hidden_size') and cfg.hidden_size >= 4096:
-                            return True
+            config = self._get_config_dict()
+            text_cfg = config.get('text_config', config)
+            if isinstance(text_cfg, dict):
+                cfg = text_cfg
+            else:
+                cfg = config
+            n_experts = cfg.get('num_local_experts',
+                        cfg.get('num_experts',
+                        cfg.get('n_routed_experts', 0)))
+            hidden_size = cfg.get('hidden_size', 0)
+            if n_experts >= 512 and hidden_size >= 4096:
+                return True
         except Exception as e:
             logger.debug(f"Error checking bfloat16 requirements: {e}")
         return False
 
-    def _apply_weight_renaming(self) -> None:
-        """Apply Nemotron-H weight renaming (up_proj->fc1, down_proj->fc2)."""
-        if self._model is None:
-            return
-        try:
-            import mlx.core as mx
+    def _fix_nemotron_h_weights(self) -> None:
+        """Fix Nemotron-H weights after JANG loading.
 
-            def _rename_weights():
-                if not hasattr(self._model, 'modules'):
-                    return
+        JANG v2 stores Nemotron-H weights with different naming and quantized
+        gate weights that mlx-lm's nemotron_h.py cannot handle directly.
+        This applies three fixes:
 
-                renamed = []
-                for module_name, module in self._model.modules():
-                    for weight_name in ['up_proj', 'down_proj']:
-                        if weight_name in module_name and weight_name not in ['gate_proj', 'win_proj', 'w1', 'w2', 'w3']:
-                            new_name = module_name.replace(weight_name, 'fc1' if weight_name == 'up_proj' else 'fc2')
-                            if hasattr(module, weight_name):
-                                weight = getattr(module, weight_name)
-                                setattr(module, new_name, weight)
-                                delattr(module, weight_name)
-                                renamed.append(f"{module_name}.{weight_name} -> {new_name}")
+        1. Rename switch_mlp.up_proj/down_proj -> switch_mlp.fc1/fc2
+        2. Dequantize MoE gate weights (stored as quantized uint32, but
+           mlx-lm expects nn.Linear with float weights)
+        3. Drop mtp.* keys (multi-token prediction, unused at inference)
+        """
+        import mlx.nn as nn
+        from mlx.utils import tree_flatten
 
-                if renamed:
-                    logger.info(f"Nemotron-H: renamed {len(renamed)} weights")
+        use_bfloat16 = self._needs_bfloat16()
+        target_dtype = mx.bfloat16 if use_bfloat16 else mx.float16
 
-            mx.eval(mx.jit(_rename_weights)())
-        except Exception as e:
-            logger.warning(f"Weight renaming failed: {e}")
+        # Flatten current weights
+        weights = dict(tree_flatten(self._model.parameters()))
+
+        # --- 1. Rename up_proj/down_proj -> fc1/fc2 ---
+        renames = {
+            "switch_mlp.up_proj": "switch_mlp.fc1",
+            "switch_mlp.down_proj": "switch_mlp.fc2",
+        }
+        renamed = {}
+        rename_count = 0
+        for k, v in weights.items():
+            new_k = k
+            for old, new in renames.items():
+                if old in k:
+                    new_k = k.replace(old, new)
+                    rename_count += 1
+                    break
+            renamed[new_k] = v
+        weights = renamed
+        if rename_count > 0:
+            logger.info(f"Nemotron-H: renamed {rename_count} switch_mlp weight keys (up_proj->fc1, down_proj->fc2)")
+
+        # --- 2. Dequantize gate weights ---
+        # Collect gate quantization parts: {prefix: {weight, scales, biases}}
+        gate_parts: dict[str, dict[str, mx.array]] = {}
+        non_gate_weights = {}
+        for k, v in weights.items():
+            if ".gate." in k:
+                # Extract prefix (everything before .gate.)
+                prefix = k[:k.index(".gate.") + len(".gate")]
+                suffix = k[k.index(".gate.") + len(".gate."):]
+                if prefix not in gate_parts:
+                    gate_parts[prefix] = {}
+                if suffix == "weight":
+                    gate_parts[prefix]["weight"] = v
+                elif suffix == "scales":
+                    gate_parts[prefix]["scales"] = v
+                elif suffix == "biases":
+                    gate_parts[prefix]["biases"] = v
+                else:
+                    # Other gate sub-keys, keep as-is
+                    non_gate_weights[k] = v
+            else:
+                non_gate_weights[k] = v
+
+        weights = non_gate_weights
+        dequant_count = 0
+        for prefix, parts in gate_parts.items():
+            gate_weight = parts.get("weight")
+            scales = parts.get("scales")
+            biases = parts.get("biases")
+
+            if gate_weight is None:
+                continue
+
+            if scales is not None and biases is not None:
+                # Gate is quantized — dequantize by trying bits in order
+                # Gate is typically 8-bit (CRITICAL tier)
+                dequantized = None
+                for bits in [8, 6, 4, 3, 2]:
+                    elem_per_u32 = 32 // bits
+                    real_cols = gate_weight.shape[-1] * elem_per_u32
+                    gs = real_cols // scales.shape[-1]
+                    if gs > 0 and gs * scales.shape[-1] == real_cols:
+                        dequantized = mx.dequantize(
+                            gate_weight, scales, biases, gs, bits
+                        )
+                        dequantized = dequantized.astype(target_dtype)
+                        logger.debug(
+                            f"Nemotron-H: dequantized {prefix}.weight "
+                            f"({bits}-bit, group_size={gs}) -> {dequantized.shape}"
+                        )
+                        break
+                if dequantized is not None:
+                    weights[f"{prefix}.weight"] = dequantized
+                    dequant_count += 1
+                else:
+                    # Could not dequantize — keep original parts
+                    logger.warning(
+                        f"Nemotron-H: could not dequantize {prefix}, "
+                        f"keeping original quantized weights"
+                    )
+                    weights[f"{prefix}.weight"] = gate_weight
+                    weights[f"{prefix}.scales"] = scales
+                    weights[f"{prefix}.biases"] = biases
+            else:
+                # Gate is not quantized, keep weight as-is
+                weights[f"{prefix}.weight"] = gate_weight
+
+        if dequant_count > 0:
+            logger.info(
+                f"Nemotron-H: dequantized {dequant_count} gate weights to {target_dtype}"
+            )
+
+        # --- 3. Drop mtp.* keys ---
+        mtp_count = sum(1 for k in weights if k.startswith("mtp."))
+        if mtp_count > 0:
+            weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
+            logger.info(f"Nemotron-H: dropped {mtp_count} mtp.* keys")
+
+        # Reload fixed weights into model (strict=False required per JANG guide)
+        weight_list = list(weights.items())
+        self._model.load_weights(weight_list, strict=False)
+
+        # Clean up stale quantization attributes on gate modules (nn.Linear)
+        # After dequantization, gate modules may still have scales/biases attrs
+        # from the original quantized load — remove them so they don't waste memory
+        for path, module in tree_flatten(
+            self._model.leaf_modules(), is_leaf=nn.Module.is_module
+        ):
+            if ".gate" in path and isinstance(module, nn.Linear):
+                for attr in ("scales", "biases"):
+                    if hasattr(module, attr):
+                        delattr(module, attr)
+
+        logger.info("Nemotron-H: weight fixup complete")
+
+
 
     def _is_vlm_model(self) -> bool:
-        """Check if this is a VLM model."""
-        if self._model is None:
-            return False
+        """Check if this is a VLM model.
+
+        Checks (in order):
+        1. jang_config.json.architecture.has_vision (primary JANG metadata)
+        2. preprocessor_config.json existence (VLM indicator)
+        3. config.json.vision_config (existing MLX pattern)
+        4. Model config for vision_config or VLM architectures (after load)
+        """
+        model_path = Path(self._model_name)
+
+        # Check 1: JANG config architecture.has_vision (primary JANG metadata)
         try:
-            config = getattr(self._model, 'config', {})
-            if isinstance(config, dict):
-                if 'vision_config' in config:
-                    return True
-                arch = config.get('architectures', [])
-                for a in arch:
-                    if 'VLM' in a or 'VL' in a or 'Vision' in a:
+            for cfg_name in ("jang_config.json", "jjqf_config.json", "jang_cfg.json"):
+                jang_config_path = model_path / cfg_name
+                if jang_config_path.exists():
+                    with open(jang_config_path) as f:
+                        jang_config = json.load(f)
+                    architecture = jang_config.get("architecture", {})
+                    if isinstance(architecture, dict) and architecture.get("has_vision") is True:
                         return True
-            return False
+                    break  # Found JANG config, no need to check others
         except Exception:
-            return False
+            pass
+
+        # Check 2: preprocessor_config.json existence (VLM indicator)
+        try:
+            preprocessor_path = model_path / "preprocessor_config.json"
+            if preprocessor_path.exists():
+                return True
+        except Exception:
+            pass
+
+        # Check 3: config.json.vision_config (existing MLX pattern, fallback)
+        try:
+            config_path = model_path / "config.json"
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = json.load(f)
+                if "vision_config" in config:
+                    return True
+                # Also check architectures for VLM hints
+                arch = config.get("architectures", [])
+                for a in arch:
+                    if "VLM" in a or "VL" in a or "Vision" in a:
+                        return True
+        except Exception:
+            pass
+
+        # Check 4: Model config (after load)
+        if self._model is not None:
+            try:
+                config = getattr(self._model, 'config', {})
+                if isinstance(config, dict):
+                    if "vision_config" in config:
+                        return True
+                    arch = config.get("architectures", [])
+                    for a in arch:
+                        if "VLM" in a or "VL" in a or "Vision" in a:
+                            return True
+            except Exception:
+                pass
+
+        return False
 
     async def start(self) -> None:
         """Start the engine (load JANG model if not loaded)."""
         if self._loaded:
             return
 
-        import asyncio
-
         from ..engine_core import AsyncEngineCore, EngineConfig
+        from ..scheduler import SchedulerConfig
 
         # Check jang-tools is available
         self._check_jang_tools_available()
+
+        # Validate that config.json and jang_config.json are consistent
+        model_path = Path(self._model_name)
+        config_path = model_path / "config.json"
+        try:
+            if config_path.exists():
+                with open(config_path) as f:
+                    config = json.load(f)
+
+                # Check for common inconsistencies
+                text_config = config.get("text_config", config)
+
+                # Get hidden_size from text_config
+                hidden_size = text_config.get("hidden_size", 0)
+                num_attention_heads = text_config.get("num_attention_heads", 1)
+                head_dim = text_config.get("head_dim", 0)
+
+                # Verify consistency: hidden_size should equal num_attention_heads * head_dim
+                if hidden_size > 0 and num_attention_heads > 0 and head_dim > 0:
+                    expected_hidden = num_attention_heads * head_dim
+                    if abs(hidden_size - expected_hidden) > 10:  # Allow small tolerance
+                        logger.warning(
+                            f"Potential config inconsistency: hidden_size={hidden_size} "
+                            f"but num_attention_heads={num_attention_heads} * head_dim={head_dim} "
+                            f"= {expected_hidden}. This may cause loading issues."
+                        )
+
+                # Check vocab_size consistency with embed_tokens
+                vocab_size = text_config.get("vocab_size", 0)
+                if vocab_size > 0:
+                    logger.debug(f"Model vocab_size: {vocab_size}, hidden_size: {hidden_size}")
+        except Exception as e:
+            logger.debug(f"Config validation skipped: {e}")
+
+        # Determine model type based on VLM indicators for jang-tools loader selection
+        is_vlm = self._is_vlm_model()
+
+        # Read the full config for jang-tools
+        model_config = None
+        try:
+            if config_path.exists():
+                with open(config_path) as f:
+                    model_config = json.load(f)
+                logger.info(
+                    f"Model config loaded: model_type={model_config.get('model_type')}, "
+                    f"architectures={model_config.get('architectures')}"
+                )
+                if "text_config" in model_config:
+                    tc = model_config["text_config"]
+                    logger.info(
+                        f"text_config: hidden_size={tc.get('hidden_size')}, "
+                        f"vocab_size={tc.get('vocab_size')}, "
+                        f"num_hidden_layers={tc.get('num_hidden_layers')}"
+                    )
+        except Exception as e:
+            logger.debug(f"Could not read full config: {e}")
 
         try:
             import jang_tools
             from jang_tools.loader import load_jang_model, load_jang_vlm_model
 
-            # Load model based on type
-            if self._is_vlm_model():
+            # Determine correct loader based on VLM detection
+            if is_vlm:
                 logger.info(f"Loading JANG VLM model: {self._model_name}")
-                self._model, self._tokenizer = await load_jang_vlm_model(
-                    self._model_name,
-                    trust_remote_code=self._trust_remote_code,
-                )
+                self._model, self._processor = load_jang_vlm_model(self._model_name)
+                # Extract tokenizer from processor for token counting
+                if hasattr(self._processor, "tokenizer"):
+                    self._tokenizer = self._processor.tokenizer
+                else:
+                    self._tokenizer = self._processor
+                # Wrap model with VLMModelAdapter for BatchGenerator compatibility
+                logger.info("Wrapping VLM model with VLMModelAdapter")
+                self._model = VLMModelAdapter(self._model)
             else:
                 logger.info(f"Loading JANG model: {self._model_name}")
-                self._model, self._tokenizer = await load_jang_model(
-                    self._model_name,
-                    trust_remote_code=self._trust_remote_code,
-                )
+                self._model, self._tokenizer = load_jang_model(self._model_name)
+                self._processor = None
 
-            # Handle Nemotron-H architecture
+            # Wrap tokenizer if needed (some VLM processors don't have encode method)
+            if self._tokenizer is not None and not hasattr(self._tokenizer, "encode"):
+                if callable(self._tokenizer):
+                    logger.debug("Wrapping callable tokenizer with encode() method")
+                    self._tokenizer = _TokenizerWrapper(self._tokenizer)
+                else:
+                    logger.warning(
+                        "Tokenizer has no encode() method and is not callable; "
+                        "token counting may fail"
+                    )
+
+            # Apply Nemotron-H weight fixups before any dtype changes
             if self._detect_nemotron_h():
-                logger.info("Detected Nemotron-H architecture, applying weight renaming")
-                self._apply_weight_renaming()
+                logger.info("Detected Nemotron-H architecture, applying weight fixups")
+                self._fix_nemotron_h_weights()
 
             # Auto-switch to bfloat16 for large expert models
             if self._needs_bfloat16():
                 logger.info("Large expert model detected (512+ experts, hidden>=4096), using bfloat16")
-                import mlx.core as mx
-                self._model = mx.cast(self._model, mx.bfloat16)
+                self._model.set_dtype(mx.bfloat16)
 
-            # Create engine config
-            scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else None
-            if scheduler_config:
-                scheduler_config.model_name = self._model_name
+            # Create engine config (copy to avoid mutating the shared instance)
+            scheduler_config = copy.copy(self._scheduler_config) if self._scheduler_config else SchedulerConfig()
+            scheduler_config.model_name = self._model_name  # Ensure cache isolation per model
             engine_config = EngineConfig(
                 model_name=self._model_name,
                 scheduler_config=scheduler_config,
