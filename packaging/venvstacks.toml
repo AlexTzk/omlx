@@ -66,6 +66,8 @@ requirements = [
     "sounddevice>=0.4.6",
     # NOTE: mlx-audio is built from git and installed with --no-deps in build.py
     # because mlx-audio pins mlx-lm==0.31.1 which conflicts with our git-pinned mlx-lm
+    # JANG model support (mixed-precision quantization)
+    "jang[mlx]>=0.1.0",
 ]
 platforms = [
     "macosx_arm64",

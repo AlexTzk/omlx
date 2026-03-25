@@ -201,133 +201,107 @@ class JANGLoader(BaseEngine):
 
         JANG v2 stores Nemotron-H weights with different naming and quantized
         gate weights that mlx-lm's nemotron_h.py cannot handle directly.
-        This applies three fixes:
 
-        1. Rename switch_mlp.up_proj/down_proj -> switch_mlp.fc1/fc2
-        2. Dequantize MoE gate weights (stored as quantized uint32, but
-           mlx-lm expects nn.Linear with float weights)
-        3. Drop mtp.* keys (multi-token prediction, unused at inference)
+        The gate weights are nn.Linear in mlx-lm's model skeleton, but JANG
+        stores them as quantized uint32. When jang-tools loads with strict=False,
+        the gate.weight (uint32) is loaded but gate.scales and gate.biases are
+        dropped because nn.Linear doesn't declare them. We must read the
+        scales/biases from the original safetensors files to dequantize.
         """
-        import mlx.nn as nn
-        from mlx.utils import tree_flatten
-
+        model_path = Path(self._model_name)
         use_bfloat16 = self._needs_bfloat16()
         target_dtype = mx.bfloat16 if use_bfloat16 else mx.float16
 
-        # Flatten current weights
-        weights = dict(tree_flatten(self._model.parameters()))
+        # Read the shard index to find which files contain gate weights
+        index_path = model_path / "model.safetensors.index.json"
+        if not index_path.exists():
+            # Try consolidated format
+            index_path = model_path / "consolidated.safetensors.index.json"
+        if not index_path.exists():
+            logger.warning("Nemotron-H: no safetensors index found, skipping gate fixup")
+            return
 
-        # --- 1. Rename up_proj/down_proj -> fc1/fc2 ---
-        renames = {
-            "switch_mlp.up_proj": "switch_mlp.fc1",
-            "switch_mlp.down_proj": "switch_mlp.fc2",
-        }
-        renamed = {}
-        rename_count = 0
-        for k, v in weights.items():
-            new_k = k
-            for old, new in renames.items():
-                if old in k:
-                    new_k = k.replace(old, new)
-                    rename_count += 1
-                    break
-            renamed[new_k] = v
-        weights = renamed
-        if rename_count > 0:
-            logger.info(f"Nemotron-H: renamed {rename_count} switch_mlp weight keys (up_proj->fc1, down_proj->fc2)")
+        with open(index_path) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {})
 
-        # --- 2. Dequantize gate weights ---
-        # Collect gate quantization parts: {prefix: {weight, scales, biases}}
-        gate_parts: dict[str, dict[str, mx.array]] = {}
-        non_gate_weights = {}
-        for k, v in weights.items():
-            if ".gate." in k:
-                # Extract prefix (everything before .gate.)
-                prefix = k[:k.index(".gate.") + len(".gate")]
-                suffix = k[k.index(".gate.") + len(".gate."):]
+        # Find all gate weight/scales/biases keys in the safetensors index
+        # Group by gate prefix (e.g., "backbone.layers.0.mixer.gate")
+        gate_parts: dict[str, dict[str, str]] = {}  # prefix -> {suffix -> shard_file}
+        for key, shard in weight_map.items():
+            if ".gate." in key:
+                prefix = key[:key.index(".gate.") + len(".gate")]
+                suffix = key[key.index(".gate.") + len(".gate."):]
                 if prefix not in gate_parts:
                     gate_parts[prefix] = {}
-                if suffix == "weight":
-                    gate_parts[prefix]["weight"] = v
-                elif suffix == "scales":
-                    gate_parts[prefix]["scales"] = v
-                elif suffix == "biases":
-                    gate_parts[prefix]["biases"] = v
-                else:
-                    # Other gate sub-keys, keep as-is
-                    non_gate_weights[k] = v
-            else:
-                non_gate_weights[k] = v
+                gate_parts[prefix][suffix] = shard
 
-        weights = non_gate_weights
-        dequant_count = 0
+        if not gate_parts:
+            logger.info("Nemotron-H: no gate weights found in index, skipping")
+            return
+
+        # Load gate tensors from safetensors and dequantize
+        dequantized_weights: list[tuple[str, mx.array]] = []
+        # Cache loaded shards to avoid re-reading
+        shard_cache: dict[str, dict[str, mx.array]] = {}
+
         for prefix, parts in gate_parts.items():
-            gate_weight = parts.get("weight")
-            scales = parts.get("scales")
-            biases = parts.get("biases")
-
-            if gate_weight is None:
+            if "weight" not in parts:
+                continue
+            if "scales" not in parts or "biases" not in parts:
+                # Gate is not quantized (no scales/biases), skip
                 continue
 
-            if scales is not None and biases is not None:
-                # Gate is quantized — dequantize by trying bits in order
-                # Gate is typically 8-bit (CRITICAL tier)
-                dequantized = None
-                for bits in [8, 6, 4, 3, 2]:
-                    elem_per_u32 = 32 // bits
-                    real_cols = gate_weight.shape[-1] * elem_per_u32
-                    gs = real_cols // scales.shape[-1]
-                    if gs > 0 and gs * scales.shape[-1] == real_cols:
-                        dequantized = mx.dequantize(
-                            gate_weight, scales, biases, gs, bits
-                        )
-                        dequantized = dequantized.astype(target_dtype)
-                        logger.debug(
-                            f"Nemotron-H: dequantized {prefix}.weight "
-                            f"({bits}-bit, group_size={gs}) -> {dequantized.shape}"
-                        )
-                        break
-                if dequantized is not None:
-                    weights[f"{prefix}.weight"] = dequantized
-                    dequant_count += 1
-                else:
-                    # Could not dequantize — keep original parts
-                    logger.warning(
-                        f"Nemotron-H: could not dequantize {prefix}, "
-                        f"keeping original quantized weights"
+            # Load the required tensors from safetensors
+            tensors: dict[str, mx.array] = {}
+            for suffix in ("weight", "scales", "biases"):
+                full_key = f"{prefix}.{suffix}"
+                shard_file = parts[suffix]
+                if shard_file not in shard_cache:
+                    shard_cache[shard_file] = mx.load(str(model_path / shard_file))
+                tensors[suffix] = shard_cache[shard_file][full_key]
+
+            gate_weight = tensors["weight"]
+            scales = tensors["scales"]
+            biases = tensors["biases"]
+
+            # Dequantize by trying bit widths (gate is typically 8-bit CRITICAL tier)
+            dequantized = None
+            for bits in [8, 6, 4, 3, 2]:
+                elem_per_u32 = 32 // bits
+                real_cols = gate_weight.shape[-1] * elem_per_u32
+                gs = real_cols // scales.shape[-1]
+                if gs > 0 and gs * scales.shape[-1] == real_cols:
+                    dequantized = mx.dequantize(
+                        gate_weight, scales, biases, gs, bits
                     )
-                    weights[f"{prefix}.weight"] = gate_weight
-                    weights[f"{prefix}.scales"] = scales
-                    weights[f"{prefix}.biases"] = biases
+                    dequantized = dequantized.astype(target_dtype)
+                    logger.info(
+                        f"Nemotron-H: dequantized {prefix}.weight "
+                        f"({bits}-bit, group_size={gs}) "
+                        f"{gate_weight.shape} -> {dequantized.shape}"
+                    )
+                    break
+
+            if dequantized is not None:
+                dequantized_weights.append((f"{prefix}.weight", dequantized))
             else:
-                # Gate is not quantized, keep weight as-is
-                weights[f"{prefix}.weight"] = gate_weight
+                logger.warning(
+                    f"Nemotron-H: could not dequantize {prefix}, "
+                    f"weight={gate_weight.shape}, scales={scales.shape}"
+                )
 
-        if dequant_count > 0:
+        # Free shard cache
+        del shard_cache
+
+        if dequantized_weights:
+            self._model.load_weights(dequantized_weights, strict=False)
             logger.info(
-                f"Nemotron-H: dequantized {dequant_count} gate weights to {target_dtype}"
+                f"Nemotron-H: dequantized {len(dequantized_weights)} "
+                f"gate weights to {target_dtype}"
             )
-
-        # --- 3. Drop mtp.* keys ---
-        mtp_count = sum(1 for k in weights if k.startswith("mtp."))
-        if mtp_count > 0:
-            weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
-            logger.info(f"Nemotron-H: dropped {mtp_count} mtp.* keys")
-
-        # Reload fixed weights into model (strict=False required per JANG guide)
-        weight_list = list(weights.items())
-        self._model.load_weights(weight_list, strict=False)
-
-        # Clean up stale quantization attributes on gate modules (nn.Linear)
-        # After dequantization, gate modules may still have scales/biases attrs
-        # from the original quantized load — remove them so they don't waste memory
-        for path, module in tree_flatten(
-            self._model.leaf_modules(), is_leaf=nn.Module.is_module
-        ):
-            if ".gate" in path and isinstance(module, nn.Linear):
-                for attr in ("scales", "biases"):
-                    if hasattr(module, attr):
-                        delattr(module, attr)
+        else:
+            logger.info("Nemotron-H: no gate weights needed dequantization")
 
         logger.info("Nemotron-H: weight fixup complete")
 
