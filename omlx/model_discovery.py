@@ -118,6 +118,14 @@ SUPPORTED_RERANKER_ARCHITECTURES = {
 # Detected by architecture + heuristic (model name or tokenizer hints).
 CAUSAL_LM_RERANKER_ARCHITECTURES = {
     "Qwen3ForCausalLM",
+    "JinaForRanking",  # Jina v3 reranker: uses <|score_token|> logits
+}
+
+# CausalLM-based embedding architectures.
+# These use a standard CausalLM architecture but are fine-tuned for embeddings
+# (no lm_head weights). Detected by architecture + directory name heuristic.
+CAUSAL_LM_EMBEDDING_ARCHITECTURES = {
+    "Qwen3ForCausalLM",  # Qwen3-Embedding uses CausalLM arch without lm_head
 }
 
 # Unsupported reranker architectures (future support)
@@ -289,15 +297,30 @@ def _is_causal_lm_reranker(model_path: Path) -> bool:
     return "reranker" in name_lower or "rerank" in name_lower
 
 
+def _is_causal_lm_embedding(model_path: Path) -> bool:
+    """
+    Heuristic check for CausalLM models fine-tuned as embedding models.
+
+    CausalLM embeddings (e.g., Qwen3-Embedding) use the same architecture as
+    their base LLMs but are fine-tuned for embeddings and ship without lm_head
+    weights. We detect them by checking the model directory name for "embedding"
+    or "embed" keywords, since config.json is identical to a standard LLM.
+    """
+    name_lower = model_path.name.lower()
+    return "embedding" in name_lower or "embed" in name_lower
+
+
 def detect_model_type(model_path: Path) -> ModelType:
     """
     Detect model type from config.json.
 
     Checks:
-    1. architectures field for reranker-specific classes (SequenceClassification)
-    2. architectures field for embedding-specific classes
-    3. model_type field against known embedding types (unambiguous only)
-    4. VLM detection via architectures, model_type, or vision_config presence
+    1. JANG VLM indicators: jang_config.json.architecture.has_vision, preprocessor_config.json
+    2. JANG models with JANG config files take priority (mixed-precision)
+    3. architectures field for reranker-specific classes (SequenceClassification)
+    4. architectures field for embedding-specific classes
+    5. model_type field against known embedding types (unambiguous only)
+    6. VLM detection via architectures, model_type, or vision_config presence
 
     Args:
         model_path: Path to model directory
@@ -305,6 +328,27 @@ def detect_model_type(model_path: Path) -> ModelType:
     Returns:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
     """
+    # JANG models with config files should use the JANG loader for mixed-precision
+    # Check for JANG config files first
+    jang_config_path = model_path / "jang_config.json"
+    if jang_config_path.exists():
+        try:
+            with open(jang_config_path) as f:
+                jang_config = json.load(f)
+            architecture = jang_config.get("architecture", {})
+            # JANG models use mixed-precision; use jang engine type
+            # Determine model type based on has_vision, but return type used for engine selection
+            has_vision = isinstance(architecture, dict) and architecture.get("has_vision") is True
+            return "vlm" if has_vision else "llm"
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # Check 2: preprocessor_config.json existence (VLM indicator)
+    preprocessor_path = model_path / "preprocessor_config.json"
+    if preprocessor_path.exists():
+        return "vlm"
+
+    # Check 3: config.json.vision_config (existing MLX pattern, fallback)
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -314,6 +358,10 @@ def detect_model_type(model_path: Path) -> ModelType:
             config = json.load(f)
     except (json.JSONDecodeError, IOError):
         return "llm"
+
+    # Check for vision_config in config.json
+    if "vision_config" in config:
+        return "vlm"
 
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])
@@ -328,6 +376,14 @@ def detect_model_type(model_path: Path) -> ModelType:
         if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
             if _is_causal_lm_reranker(model_path):
                 return "reranker"
+
+    # Check for CausalLM-based embeddings (e.g., Qwen3-Embedding).
+    # These use a standard CausalLM architecture but are fine-tuned for embeddings
+    # and ship without lm_head weights. Detected by architecture + directory name hint.
+    for arch in architectures:
+        if arch in CAUSAL_LM_EMBEDDING_ARCHITECTURES:
+            if _is_causal_lm_embedding(model_path):
+                return "embedding"
 
     # Check architectures field for embedding (before model_type to avoid
     # false positives from ambiguous model types like qwen3, gemma3-text)
@@ -373,8 +429,16 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: presence of vision_config (fallback heuristic)
     # Catch-all for VLMs that aren't yet listed in VLM_MODEL_TYPES.
+    # Note: This was already checked earlier, but we keep it here for non-JANG models
+    # that may have config.json without vision_config in the early path.
     if "vision_config" in config:
         return "vlm"
+
+    # Check for VLM: architectures field (for VLM architectures not in
+    # VLM_ARCHITECTURES)
+    for arch in architectures:
+        if "VLM" in arch or "VL" in arch or "Vision" in arch:
+            return "vlm"
 
     # Check for audio models — architectures take priority over model_type.
     # Only top-level architectures/model_type are inspected; nested audio_config
@@ -449,9 +513,24 @@ def estimate_model_size(model_path: Path) -> int:
     return int(total_size * overhead_factor)
 
 
+def _is_adapter_dir(path: Path) -> bool:
+    """Check if a directory contains a LoRA/PEFT adapter (has adapter_config.json)."""
+    return (path / "adapter_config.json").exists()
+
+
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists()
+    """Check if a directory contains a valid model (has config.json or jang_config.json)."""
+    if _is_adapter_dir(path):
+        return False
+    if (path / "config.json").exists():
+        return True
+    # JANG models use jang_config.json, jjqf_config.json, or jang_cfg.json
+    return any((path / f).exists() for f in JANG_CONFIG_FILES)
+
+
+def _is_jang_model(model_path: Path) -> bool:
+    """Check if directory contains a JANG model config file."""
+    return any((model_path / f).exists() for f in JANG_CONFIG_FILES)
 
 
 def _register_model(
@@ -466,10 +545,19 @@ def _register_model(
             return
 
         model_type = detect_model_type(model_dir)
+
+        # JANG models with config files should use the JANG loader for mixed-precision
+        # Check if this is a JANG model first (takes priority over vlm/batched)
+        is_jang = _is_jang_model(model_dir)
+
         if model_type == "embedding":
             engine_type: EngineType = "embedding"
         elif model_type == "reranker":
             engine_type = "reranker"
+        elif is_jang:
+            # JANG models use the JANGLoader for mixed-precision quantization
+            # This takes priority over vlm/batched for JANG models
+            engine_type = "jang"
         elif model_type == "vlm":
             engine_type = "vlm"
         elif model_type == "audio_stt":
@@ -551,7 +639,12 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
         if not subdir.is_dir() or subdir.name.startswith("."):
             continue
 
-        if _is_model_dir(subdir):
+        if _is_adapter_dir(subdir):
+            logger.info(
+                f"Skipping LoRA adapter: {subdir.name} "
+                "(oMLX does not support LoRA/PEFT adapters)"
+            )
+        elif _is_model_dir(subdir):
             # Level 1: direct model folder
             _register_model(models, subdir, subdir.name)
         else:
@@ -560,7 +653,12 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             for child in sorted(subdir.iterdir()):
                 if not child.is_dir() or child.name.startswith("."):
                     continue
-                if _is_model_dir(child):
+                if _is_adapter_dir(child):
+                    logger.info(
+                        f"Skipping LoRA adapter: {child.name} "
+                        "(oMLX does not support LoRA/PEFT adapters)"
+                    )
+                elif _is_model_dir(child):
                     has_children = True
                     _register_model(models, child, child.name)
 

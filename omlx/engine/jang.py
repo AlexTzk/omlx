@@ -9,14 +9,12 @@ with mixed-precision quantization (attention 6-8-bit, experts 2-4-bit).
 from __future__ import annotations
 
 import copy
-import gc
 import json
 import logging
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
@@ -24,69 +22,6 @@ from ..models.vlm import VLMModelAdapter
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
-
-
-_auto_image_processor_patched = False
-
-
-def _patch_auto_image_processor():
-    """Replace the AutoImageProcessor dummy with the real class.
-
-    In PyTorch-free environments, ``transformers`` replaces
-    ``AutoImageProcessor`` with a dummy that raises ``ImportError``.
-    The actual image-processor classes only need PIL, so we import the
-    real ``AutoImageProcessor`` from the internal auto module (which is
-    not behind the backend gate) and swap it into the public namespace.
-
-    Must be called **before** any code that does
-    ``from transformers import AutoImageProcessor``.
-    """
-    global _auto_image_processor_patched
-    if _auto_image_processor_patched:
-        return
-    _auto_image_processor_patched = True
-
-    try:
-        from transformers import AutoImageProcessor
-
-        if "dummy" not in getattr(AutoImageProcessor, "__module__", ""):
-            return  # Real class already available — nothing to do
-    except ImportError:
-        pass
-
-    try:
-        from transformers.models.auto.image_processing_auto import (
-            AutoImageProcessor as _RealAutoImageProcessor,
-        )
-        import transformers
-
-        transformers.AutoImageProcessor = _RealAutoImageProcessor
-        logger.debug("Bypassed AutoImageProcessor backend gate for MLX")
-    except ImportError:
-        logger.debug("Real AutoImageProcessor not available in this transformers version")
-
-
-def _infer_bits_and_group_size(
-    weight_shape: tuple, scales_shape: tuple
-) -> tuple[int | None, int | None]:
-    """Infer quantization bits and group_size from weight/scales shapes.
-
-    JANG models use mixed-precision quantization — different tensors have
-    different bit widths.  The actual bits can be recovered from the ratio
-    of packed uint32 columns (weight) to group count (scales).
-
-    See: JANG Integration Guide § "Inferring Bit Width Per Tensor"
-    """
-    w_cols = weight_shape[-1]  # packed columns
-    s_cols = scales_shape[-1]  # number of groups
-    for bits in [2, 3, 4, 5, 6, 8]:
-        elem_per_u32 = 32 // bits
-        in_features = w_cols * elem_per_u32
-        if s_cols > 0:
-            group_size = in_features // s_cols
-            if group_size > 0 and group_size * s_cols == in_features:
-                return bits, group_size
-    return None, None
 
 
 class _TokenizerWrapper:
@@ -153,10 +88,6 @@ class JANGLoader(BaseEngine):
         model_settings: Any | None = None,
     ):
         self._model_name = model_name
-        self._scheduler_config = scheduler_config
-        self._stream_interval = stream_interval
-        self._enable_thinking = enable_thinking
-        self._model_settings = model_settings
         self._scheduler_config = scheduler_config
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
@@ -265,427 +196,142 @@ class JANGLoader(BaseEngine):
             logger.debug(f"Error checking bfloat16 requirements: {e}")
         return False
 
-    def _fix_jang_quantized_bits(self) -> None:
-        """Fix per-tensor quantization bits for JANG mixed-precision models.
-
-        After loading with uniform default bits (from config.json), each
-        QuantizedLinear / QuantizedEmbedding / QuantizedSwitchLinear layer
-        may have the wrong bits and group_size.  This infers the correct
-        values from the actual weight and scales tensor shapes.
-
-        See: JANG Integration Guide § "Setting Up QuantizedLinear Per Tensor"
-        """
-        if self._model is None:
-            return
-        fixed = 0
-        for name, module in self._model.named_modules():
-            if not (
-                hasattr(module, "bits")
-                and hasattr(module, "weight")
-                and hasattr(module, "scales")
-            ):
-                continue
-            bits, gs = _infer_bits_and_group_size(
-                module.weight.shape, module.scales.shape
-            )
-            if bits is not None:
-                module.bits = bits
-                module.group_size = gs
-                fixed += 1
-        if fixed:
-            logger.info(f"Fixed JANG quantization bits for {fixed} layers")
-
     def _fix_nemotron_h_weights(self) -> None:
         """Fix Nemotron-H weights after JANG loading.
 
         JANG v2 stores Nemotron-H weights with different naming and quantized
         gate weights that mlx-lm's nemotron_h.py cannot handle directly.
+        This applies three fixes:
 
-        The gate weights are nn.Linear in mlx-lm's model skeleton, but JANG
-        stores them as quantized uint32. When jang-tools loads with strict=False,
-        the gate.weight (uint32) is loaded but gate.scales and gate.biases are
-        dropped because nn.Linear doesn't declare them. We must read the
-        scales/biases from the original safetensors files to dequantize.
+        1. Rename switch_mlp.up_proj/down_proj -> switch_mlp.fc1/fc2
+        2. Dequantize MoE gate weights (stored as quantized uint32, but
+           mlx-lm expects nn.Linear with float weights)
+        3. Drop mtp.* keys (multi-token prediction, unused at inference)
         """
-        model_path = Path(self._model_name)
+        import mlx.nn as nn
+        from mlx.utils import tree_flatten
+
         use_bfloat16 = self._needs_bfloat16()
         target_dtype = mx.bfloat16 if use_bfloat16 else mx.float16
 
-        # Read the shard index to find which files contain gate weights
-        index_path = model_path / "model.safetensors.index.json"
-        if not index_path.exists():
-            # Try consolidated format
-            index_path = model_path / "consolidated.safetensors.index.json"
-        if not index_path.exists():
-            logger.warning("Nemotron-H: no safetensors index found, skipping gate fixup")
-            return
+        # Flatten current weights
+        weights = dict(tree_flatten(self._model.parameters()))
 
-        with open(index_path) as f:
-            index = json.load(f)
-        weight_map = index.get("weight_map", {})
+        # --- 1. Rename up_proj/down_proj -> fc1/fc2 ---
+        renames = {
+            "switch_mlp.up_proj": "switch_mlp.fc1",
+            "switch_mlp.down_proj": "switch_mlp.fc2",
+        }
+        renamed = {}
+        rename_count = 0
+        for k, v in weights.items():
+            new_k = k
+            for old, new in renames.items():
+                if old in k:
+                    new_k = k.replace(old, new)
+                    rename_count += 1
+                    break
+            renamed[new_k] = v
+        weights = renamed
+        if rename_count > 0:
+            logger.info(f"Nemotron-H: renamed {rename_count} switch_mlp weight keys (up_proj->fc1, down_proj->fc2)")
 
-        # Find all gate weight/scales/biases keys in the safetensors index
-        # Group by gate prefix (e.g., "backbone.layers.0.mixer.gate")
-        gate_parts: dict[str, dict[str, str]] = {}  # prefix -> {suffix -> shard_file}
-        for key, shard in weight_map.items():
-            if ".gate." in key:
-                prefix = key[:key.index(".gate.") + len(".gate")]
-                suffix = key[key.index(".gate.") + len(".gate."):]
+        # --- 2. Dequantize gate weights ---
+        # Collect gate quantization parts: {prefix: {weight, scales, biases}}
+        gate_parts: dict[str, dict[str, mx.array]] = {}
+        non_gate_weights = {}
+        for k, v in weights.items():
+            if ".gate." in k:
+                # Extract prefix (everything before .gate.)
+                prefix = k[:k.index(".gate.") + len(".gate")]
+                suffix = k[k.index(".gate.") + len(".gate."):]
                 if prefix not in gate_parts:
                     gate_parts[prefix] = {}
-                gate_parts[prefix][suffix] = shard
-
-        if not gate_parts:
-            logger.info("Nemotron-H: no gate weights found in index, skipping")
-            return
-
-        # Load gate tensors from safetensors and dequantize
-        dequantized_weights: list[tuple[str, mx.array]] = []
-        # Cache loaded shards to avoid re-reading
-        shard_cache: dict[str, dict[str, mx.array]] = {}
-
-        for prefix, parts in gate_parts.items():
-            if "weight" not in parts:
-                continue
-            if "scales" not in parts or "biases" not in parts:
-                # Gate is not quantized (no scales/biases), skip
-                continue
-
-            # Load the required tensors from safetensors
-            tensors: dict[str, mx.array] = {}
-            for suffix in ("weight", "scales", "biases"):
-                full_key = f"{prefix}.{suffix}"
-                shard_file = parts[suffix]
-                if shard_file not in shard_cache:
-                    shard_cache[shard_file] = mx.load(str(model_path / shard_file))
-                tensors[suffix] = shard_cache[shard_file][full_key]
-
-            gate_weight = tensors["weight"]
-            scales = tensors["scales"]
-            biases = tensors["biases"]
-
-            # Dequantize by trying bit widths (gate is typically 8-bit CRITICAL tier)
-            dequantized = None
-            for bits in [8, 6, 4, 3, 2]:
-                elem_per_u32 = 32 // bits
-                real_cols = gate_weight.shape[-1] * elem_per_u32
-                gs = real_cols // scales.shape[-1]
-                if gs > 0 and gs * scales.shape[-1] == real_cols:
-                    dequantized = mx.dequantize(
-                        gate_weight, scales, biases, gs, bits
-                    )
-                    dequantized = dequantized.astype(target_dtype)
-                    logger.info(
-                        f"Nemotron-H: dequantized {prefix}.weight "
-                        f"({bits}-bit, group_size={gs}) "
-                        f"{gate_weight.shape} -> {dequantized.shape}"
-                    )
-                    break
-
-            if dequantized is not None:
-                dequantized_weights.append((f"{prefix}.weight", dequantized))
+                if suffix == "weight":
+                    gate_parts[prefix]["weight"] = v
+                elif suffix == "scales":
+                    gate_parts[prefix]["scales"] = v
+                elif suffix == "biases":
+                    gate_parts[prefix]["biases"] = v
+                else:
+                    # Other gate sub-keys, keep as-is
+                    non_gate_weights[k] = v
             else:
-                logger.warning(
-                    f"Nemotron-H: could not dequantize {prefix}, "
-                    f"weight={gate_weight.shape}, scales={scales.shape}"
-                )
+                non_gate_weights[k] = v
 
-        # Free shard cache
-        del shard_cache
+        weights = non_gate_weights
+        dequant_count = 0
+        for prefix, parts in gate_parts.items():
+            gate_weight = parts.get("weight")
+            scales = parts.get("scales")
+            biases = parts.get("biases")
 
-        if dequantized_weights:
-            self._model.load_weights(dequantized_weights, strict=False)
+            if gate_weight is None:
+                continue
+
+            if scales is not None and biases is not None:
+                # Gate is quantized — dequantize by trying bits in order
+                # Gate is typically 8-bit (CRITICAL tier)
+                dequantized = None
+                for bits in [8, 6, 4, 3, 2]:
+                    elem_per_u32 = 32 // bits
+                    real_cols = gate_weight.shape[-1] * elem_per_u32
+                    gs = real_cols // scales.shape[-1]
+                    if gs > 0 and gs * scales.shape[-1] == real_cols:
+                        dequantized = mx.dequantize(
+                            gate_weight, scales, biases, gs, bits
+                        )
+                        dequantized = dequantized.astype(target_dtype)
+                        logger.debug(
+                            f"Nemotron-H: dequantized {prefix}.weight "
+                            f"({bits}-bit, group_size={gs}) -> {dequantized.shape}"
+                        )
+                        break
+                if dequantized is not None:
+                    weights[f"{prefix}.weight"] = dequantized
+                    dequant_count += 1
+                else:
+                    # Could not dequantize — keep original parts
+                    logger.warning(
+                        f"Nemotron-H: could not dequantize {prefix}, "
+                        f"keeping original quantized weights"
+                    )
+                    weights[f"{prefix}.weight"] = gate_weight
+                    weights[f"{prefix}.scales"] = scales
+                    weights[f"{prefix}.biases"] = biases
+            else:
+                # Gate is not quantized, keep weight as-is
+                weights[f"{prefix}.weight"] = gate_weight
+
+        if dequant_count > 0:
             logger.info(
-                f"Nemotron-H: dequantized {len(dequantized_weights)} "
-                f"gate weights to {target_dtype}"
+                f"Nemotron-H: dequantized {dequant_count} gate weights to {target_dtype}"
             )
-        else:
-            logger.info("Nemotron-H: no gate weights needed dequantization")
+
+        # --- 3. Drop mtp.* keys ---
+        mtp_count = sum(1 for k in weights if k.startswith("mtp."))
+        if mtp_count > 0:
+            weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
+            logger.info(f"Nemotron-H: dropped {mtp_count} mtp.* keys")
+
+        # Reload fixed weights into model (strict=False required per JANG guide)
+        weight_list = list(weights.items())
+        self._model.load_weights(weight_list, strict=False)
+
+        # Clean up stale quantization attributes on gate modules (nn.Linear)
+        # After dequantization, gate modules may still have scales/biases attrs
+        # from the original quantized load — remove them so they don't waste memory
+        for path, module in tree_flatten(
+            self._model.leaf_modules(), is_leaf=nn.Module.is_module
+        ):
+            if ".gate" in path and isinstance(module, nn.Linear):
+                for attr in ("scales", "biases"):
+                    if hasattr(module, attr):
+                        delattr(module, attr)
 
         logger.info("Nemotron-H: weight fixup complete")
 
-    def _load_jang_vlm_manual(self):
-        """Load JANG VLM following the JANG creator's reference implementation.
 
-        Uses mlx_vlm for model architecture + processor and jang_tools for
-        weight loading + per-tensor bit fixing.  Does **not** need PyTorch
-        (unlike ``load_jang_vlm_model`` which uses ``AutoImageProcessor``).
-
-        Returns:
-            ``(model, processor)`` — the VLM model and its processor.
-        """
-        import gc
-
-        import mlx.nn as nn
-        from jang_tools.loader import _fix_quantized_bits, _get_v2_weight_files
-        from mlx_vlm.utils import (
-            get_model_and_args,
-            load_processor,
-            skip_multimodal_module,
-            update_module_configs,
-        )
-
-        from .vlm import _patch_video_processor_bug
-
-        _patch_video_processor_bug()
-
-        model_path = Path(self._model_name)
-        vlm_config = json.loads((model_path / "config.json").read_text())
-
-        # Build model skeleton from mlx_vlm model registry
-        model_class, _ = get_model_and_args(config=vlm_config)
-        model_config = model_class.ModelConfig.from_dict(vlm_config)
-        modules = ["text", "vision", "perceiver", "projector", "audio"]
-        model_config = update_module_configs(
-            model_config, model_class, vlm_config, modules
-        )
-
-        # update_module_configs may not propagate every parameter from the
-        # raw JSON into the typed config objects (dataclass fields that
-        # don't exist yet are silently dropped).  Back-fill anything that
-        # is still None on text_config from the raw dict — this is
-        # critical for rope_theta, rope_scaling, head_dim, etc.
-        raw_text_cfg = vlm_config.get("text_config", vlm_config)
-        text_cfg = getattr(model_config, "text_config", None)
-        if text_cfg is not None:
-            for key, value in raw_text_cfg.items():
-                if value is not None and not isinstance(value, dict):
-                    if getattr(text_cfg, key, None) is None:
-                        try:
-                            setattr(text_cfg, key, value)
-                        except Exception:
-                            pass
-            # Also check top-level VLM config as final fallback
-            for key in ("rope_theta", "rope_scaling", "head_dim"):
-                if getattr(text_cfg, key, None) is None and key in vlm_config:
-                    try:
-                        setattr(text_cfg, key, vlm_config[key])
-                    except Exception:
-                        pass
-
-        model = model_class.Model(model_config)
-
-        # Fix RoPE layers that were created without a base frequency.
-        # This happens when update_module_configs / ModelConfig.from_dict
-        # drops rope_theta (frozen dataclass, missing field, version skew).
-        rope_theta = (
-            raw_text_cfg.get("rope_theta")
-            or raw_text_cfg.get("rope_parameters", {}).get("rope_theta")
-            or vlm_config.get("rope_theta")
-            or vlm_config.get("rope_parameters", {}).get("rope_theta")
-        )
-        if rope_theta:
-            import mlx.nn as _nn
-
-            for _name, _mod in model.named_modules():
-                if isinstance(_mod, _nn.RoPE) and _mod._base is None:
-                    _mod._base = float(rope_theta)
-                    logger.debug(
-                        f"Set rope_theta={rope_theta} on {_name}"
-                    )
-
-        # Pre-quantize layers that JANG will fill with mixed-bit weights.
-        # Skip vision/multimodal layers (kept fp16) and MoE gate (not gate_proj).
-        def _class_pred(p, m):
-            if skip_multimodal_module(p):
-                return False
-            if "gate" in p and "gate_proj" not in p:
-                return False
-            return hasattr(m, "to_quantized")
-
-        quant_cfg = vlm_config.get("quantization", {})
-        qbits = quant_cfg.get("bits", 4)
-        qgs = quant_cfg.get("group_size", 64)
-        nn.quantize(
-            model, group_size=qgs, bits=qbits, class_predicate=_class_pred
-        )
-
-        # Load JANG v2 safetensor shards
-        for sf in _get_v2_weight_files(model_path):
-            w = mx.load(str(sf))
-            clean = {
-                k: v
-                for k, v in w.items()
-                if not k.endswith(".importance")
-                and not k.startswith("mtp.")
-                and "activation_scale" not in k
-                and "scale_inv" not in k
-            }
-            try:
-                clean = model.sanitize(clean)
-            except Exception:
-                pass
-            model.load_weights(list(clean.items()), strict=False)
-            del clean, w
-            gc.collect()
-
-        # Correct per-tensor bit widths
-        _fix_quantized_bits(model, {})
-
-        # bfloat16 for numerical stability on large models
-        self._model = model  # needed by _needs_bfloat16
-        if self._needs_bfloat16():
-            logger.info("Applying bfloat16 for large expert model")
-            model.set_dtype(mx.bfloat16)
-
-        mx.eval(model.parameters())
-
-        model.config = model_config
-
-        # Try loading the full processor (needed for image/OCR input).
-        # Some model-specific processors (e.g. PixtralProcessor) are also
-        # gated behind PyTorch in transformers.  When that happens, fall
-        # back to a plain tokenizer — text inference still works.
-        try:
-            processor = load_processor(model_path, processor_config=vlm_config)
-            logger.info("JANG VLM loaded via manual path (full processor)")
-        except ImportError as proc_err:
-            logger.warning(
-                f"VLM processor unavailable ({proc_err}), "
-                f"loading tokenizer only (text works, image input disabled)"
-            )
-            from mlx_lm.utils import load_tokenizer
-
-            processor = load_tokenizer(model_path)
-
-        return model, processor
-
-    def _detect_mistral4_text(self) -> bool:
-        """Check if model has a mistral4 text backbone (MLA + MoE).
-
-        Mistral-Small-4 and similar models use ``mistral3`` as the top-level
-        model_type (VLM wrapper) with ``text_config.model_type == "mistral4"``.
-        The ``mistral4`` architecture uses Multi-Latent Attention (MLA) which
-        is architecturally identical to DeepSeek-V3 but not yet supported by
-        mlx-lm's ``mistral3`` module (which falls back to ``llama``).
-        """
-        model_path = Path(self._model_name)
-        try:
-            config_path = model_path / "config.json"
-            if config_path.exists():
-                with open(config_path) as f:
-                    config = json.load(f)
-                tc = config.get("text_config", {})
-                return tc.get("model_type") == "mistral4"
-        except Exception:
-            pass
-        return False
-
-    def _load_jang_mistral4(self):
-        """Load a JANG model with mistral4 text backbone using deepseek_v3.
-
-        The mistral4 text architecture uses MLA (Multi-Latent Attention) which
-        is architecturally identical to DeepSeek-V3.  Since mlx-lm does not
-        yet have a native ``mistral4`` model, we load using ``deepseek_v3``
-        with custom weight mapping:
-
-        1. Build deepseek_v3 model skeleton from text_config
-        2. Pre-quantize the skeleton at the config-specified bit width
-        3. Load JANG v2 weights, stripping the ``language_model.`` prefix
-        4. Split ``kv_b_proj`` into ``embed_q`` + ``unembed_out`` (MLA KV
-           decomposition), re-quantizing at the pre-quant bits
-        5. Fix per-tensor quantization bits
-
-        Returns:
-            ``(model, tokenizer)``
-        """
-        import time
-
-        from jang_tools.loader import _fix_quantized_bits, _get_v2_weight_files
-        from mlx_lm.models.deepseek_v3 import Model, ModelArgs
-        from mlx_lm.utils import load_tokenizer
-
-        model_path = Path(self._model_name)
-        config = json.loads((model_path / "config.json").read_text())
-        tc = config["text_config"]
-
-        # Map mistral4 config → deepseek_v3 config
-        tc["rope_scaling"] = tc.pop("rope_parameters", None)
-        if tc.get("rope_scaling"):
-            tc["rope_theta"] = tc["rope_scaling"].get("rope_theta", 10000.0)
-        tc["model_type"] = "deepseek_v3"
-
-        args = ModelArgs.from_dict(tc)
-        model = Model(args)
-
-        # Pre-quantize at config-specified bits
-        quant = config.get("quantization", {"group_size": 64, "bits": 4})
-        quant_bits = quant.get("bits", 4)
-        quant_gs = quant.get("group_size", 64)
-        nn.quantize(model, group_size=quant_gs, bits=quant_bits)
-
-        start = time.perf_counter()
-        for sf in _get_v2_weight_files(model_path):
-            w = mx.load(str(sf))
-            clean = {}
-            for k, v in w.items():
-                if (
-                    k.endswith(".importance")
-                    or k.startswith("mtp.")
-                    or "activation_scale" in k
-                    or "scale_inv" in k
-                ):
-                    continue
-                # Strip language_model. prefix (keep model.)
-                if k.startswith("language_model."):
-                    k = k[len("language_model."):]
-                clean[k] = v
-
-            # Split kv_b_proj → embed_q + unembed_out for MLA
-            for layer_idx in range(args.num_hidden_layers):
-                pfx = f"model.layers.{layer_idx}.self_attn"
-                wkey = f"{pfx}.kv_b_proj.weight"
-                skey = f"{pfx}.kv_b_proj.scales"
-                bkey = f"{pfx}.kv_b_proj.biases"
-                if wkey not in clean or skey not in clean:
-                    continue
-
-                qw = clean.pop(wkey)
-                scales = clean.pop(skey)
-                biases = clean.pop(bkey, mx.zeros_like(scales))
-
-                # Infer original quantization from shapes
-                orig_bits = (qw.shape[-1] * 32) // args.kv_lora_rank
-                orig_gs = args.kv_lora_rank // scales.shape[-1]
-
-                # Dequantize → reshape → split
-                dq = mx.dequantize(qw, scales, biases, orig_gs, orig_bits)
-                head_dim = args.qk_nope_head_dim + args.v_head_dim
-                dq = dq.reshape(args.num_attention_heads, head_dim, -1)
-                wk = mx.contiguous(
-                    dq[:, : args.qk_nope_head_dim, :].swapaxes(-1, -2)
-                )
-                wv = mx.contiguous(dq[:, args.qk_nope_head_dim :, :])
-
-                # Re-quantize at the pre-quant bits (not original)
-                wk_q, wk_s, wk_b = mx.quantize(wk, quant_gs, quant_bits)
-                wv_q, wv_s, wv_b = mx.quantize(wv, quant_gs, quant_bits)
-
-                clean[f"{pfx}.embed_q.weight"] = wk_q
-                clean[f"{pfx}.embed_q.scales"] = wk_s
-                clean[f"{pfx}.embed_q.biases"] = wk_b
-                clean[f"{pfx}.unembed_out.weight"] = wv_q
-                clean[f"{pfx}.unembed_out.scales"] = wv_s
-                clean[f"{pfx}.unembed_out.biases"] = wv_b
-
-            model.load_weights(list(clean.items()), strict=False)
-            del clean, w
-            gc.collect()
-
-        _fix_quantized_bits(model, {})
-        mx.eval(model.parameters())
-
-        elapsed = time.perf_counter() - start
-        logger.info(
-            f"JANG mistral4→deepseek_v3 loaded in {elapsed:.1f}s: "
-            f"{self._model_name}"
-        )
-
-        tokenizer = load_tokenizer(
-            model_path,
-            eos_token_ids=config.get("eos_token_id", None),
-        )
-        return model, tokenizer
 
     def _is_vlm_model(self) -> bool:
         """Check if this is a VLM model.
@@ -796,6 +442,9 @@ class JANGLoader(BaseEngine):
         except Exception as e:
             logger.debug(f"Config validation skipped: {e}")
 
+        # Determine model type based on VLM indicators for jang-tools loader selection
+        is_vlm = self._is_vlm_model()
+
         # Read the full config for jang-tools
         model_config = None
         try:
@@ -818,24 +467,20 @@ class JANGLoader(BaseEngine):
 
         try:
             import jang_tools
-            from jang_tools.loader import load_jang_model
+            from jang_tools.loader import load_jang_model, load_jang_vlm_model
 
-            # ── Loader selection ─────────────────────────────────
-            # 1. mistral4 text backbone: custom deepseek_v3-based loader
-            #    (mlx-lm's mistral3 module falls back to llama which
-            #    cannot handle MLA attention)
-            # 2. All other JANG models: use load_jang_model (text path)
-            #    even for VLMs — the text loader produces correct weights
-            #    and text inference works.  The VLM path (load_jang_vlm_model
-            #    / _load_jang_vlm_manual) can corrupt weights for models
-            #    whose mlx_vlm model registry differs from mlx_lm.
-            if self._detect_mistral4_text():
-                logger.info(
-                    f"Loading JANG mistral4 model via deepseek_v3: "
-                    f"{self._model_name}"
-                )
-                self._model, self._tokenizer = self._load_jang_mistral4()
-                self._processor = None
+            # Determine correct loader based on VLM detection
+            if is_vlm:
+                logger.info(f"Loading JANG VLM model: {self._model_name}")
+                self._model, self._processor = load_jang_vlm_model(self._model_name)
+                # Extract tokenizer from processor for token counting
+                if hasattr(self._processor, "tokenizer"):
+                    self._tokenizer = self._processor.tokenizer
+                else:
+                    self._tokenizer = self._processor
+                # Wrap model with VLMModelAdapter for BatchGenerator compatibility
+                logger.info("Wrapping VLM model with VLMModelAdapter")
+                self._model = VLMModelAdapter(self._model)
             else:
                 logger.info(f"Loading JANG model: {self._model_name}")
                 self._model, self._tokenizer = load_jang_model(self._model_name)
