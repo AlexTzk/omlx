@@ -523,7 +523,6 @@ class EnginePool:
             elif effective_type == "reranker":
                 # RerankerEngine for reranker models
                 engine = RerankerEngine(model_name=entry.model_path)
-<<<<<<< HEAD
             elif entry.engine_type == "jang":
                 # JANGLoader for JANG quantized models
                 from .engine.jang import JANGLoader
