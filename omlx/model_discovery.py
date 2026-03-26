@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
 EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
 
+# JANG model config file names
+JANG_CONFIG_FILES = ("jang_config.json", "jjqf_config.json", "jang_cfg.json")
+
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
     "qwen2_vl",
