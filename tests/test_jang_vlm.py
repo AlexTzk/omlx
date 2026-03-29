@@ -1,248 +1,226 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for JANG VLM (Vision-Language Model) detection and loading.
-
-Tests cover:
-- JANG VLM detection via jang_config.architecture.has_vision
-- JANG VLM detection via preprocessor_config.json
-- JANG VLM detection via config.json.vision_config
-- VLM model type detection in detect_model_type()
-- Engine type selection for JANG VLM models
-"""
+"""Tests for JANG-specific discovery and live JANGLoader behavior."""
 
 import json
-import tempfile
-from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from omlx.engine.jang import JANGLoader
-from omlx.model_discovery import detect_model_type
+from omlx.model_discovery import detect_model_type, discover_models
 
 
-class TestJANGLoaderVlmDetection:
-    """Tests for JANGLoader._is_vlm_model() detection logic."""
+class _FakeArray:
+    """Small array-like test double for patched mlx calls."""
 
-    def test_is_vlm_via_has_vision(self, tmp_path):
-        """Test VLM detection via jang_config.architecture.has_vision."""
-        # Create jang_config.json with has_vision=true
-        jang_config = {
-            "version": "1.0",
-            "architecture": {
-                "has_vision": True,
-                "has_moe": False,
-                "has_ssm": False,
-            },
-        }
-        (tmp_path / "jang_config.json").write_text(json.dumps(jang_config))
+    def __init__(self, shape):
+        self.shape = shape
 
-        loader = JANGLoader(str(tmp_path))
-        assert loader._is_vlm_model() is True
-
-    def test_is_vlm_via_has_vision_false(self, tmp_path):
-        """Test non-VLM detection via jang_config.architecture.has_vision=false."""
-        jang_config = {
-            "version": "1.0",
-            "architecture": {
-                "has_vision": False,
-                "has_moe": True,
-                "has_ssm": True,
-            },
-        }
-        (tmp_path / "jang_config.json").write_text(json.dumps(jang_config))
-
-        loader = JANGLoader(str(tmp_path))
-        assert loader._is_vlm_model() is False
-
-    def test_is_vlm_via_preprocessor_config(self, tmp_path):
-        """Test VLM detection via preprocessor_config.json existence."""
-        # Create preprocessor_config.json (common in VLMs)
-        preprocessor_config = {
-            "processor_type": "AutoProcessor",
-            "vision_feature_extractor_type": "CLIPImageProcessor",
-        }
-        (tmp_path / "preprocessor_config.json").write_text(json.dumps(preprocessor_config))
-
-        loader = JANGLoader(str(tmp_path))
-        assert loader._is_vlm_model() is True
-
-    def test_is_vlm_via_vision_config(self, tmp_path):
-        """Test VLM detection via config.json.vision_config."""
-        config = {
-            "model_type": "some_vlm",
-            "vision_config": {"hidden_size": 1024},
-            "text_config": {"hidden_size": 2048},
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-
-        loader = JANGLoader(str(tmp_path))
-        assert loader._is_vlm_model() is True
-
-    def test_is_vlm_vlm_architecture_in_config(self, tmp_path):
-        """Test VLM detection via VLM architecture in config.json."""
-        config = {
-            "model_type": "qwen2_vl",
-            "architectures": ["Qwen2VLForConditionalGeneration"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-
-        loader = JANGLoader(str(tmp_path))
-        assert loader._is_vlm_model() is True
-
-    def test_is_not_vlm_no_indicators(self, tmp_path):
-        """Test non-VLM detection when no indicators present."""
-        config = {
-            "model_type": "llama",
-            "architectures": ["LlamaForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-
-        loader = JANGLoader(str(tmp_path))
-        assert loader._is_vlm_model() is False
-
-    def test_is_vlm_multiple_indicators(self, tmp_path):
-        """Test VLM detection with multiple indicators present."""
-        jang_config = {
-            "version": "1.0",
-            "architecture": {"has_vision": True},
-        }
-        (tmp_path / "jang_config.json").write_text(json.dumps(jang_config))
-        (tmp_path / "preprocessor_config.json").write_text("{}")
-        config = {"vision_config": {}}
-        (tmp_path / "config.json").write_text(json.dumps(config))
-
-        loader = JANGLoader(str(tmp_path))
-        assert loader._is_vlm_model() is True
+    def astype(self, _dtype):
+        return self
 
 
 class TestDetectModelTypeJangVlm:
-    """Tests for detect_model_type() with JANG VLM indicators."""
+    """Tests for production JANG VLM detection in model_discovery."""
 
     def test_detect_vlm_via_jang_has_vision(self, tmp_path):
-        """Test VLM detection via jang_config.architecture.has_vision in model_discovery."""
-        jang_config = {
-            "version": "1.0",
-            "architecture": {"has_vision": True},
-        }
-        (tmp_path / "jang_config.json").write_text(json.dumps(jang_config))
-        # config.json without vision_config should still be detected as VLM
-        config = {"model_type": "jang_vlm"}
-        (tmp_path / "config.json").write_text(json.dumps(config))
-
-        assert detect_model_type(tmp_path) == "vlm"
-
-    def test_detect_vlm_via_preprocessor_config(self, tmp_path):
-        """Test VLM detection via preprocessor_config.json in model_discovery."""
-        preprocessor_config = {
-            "processor_type": "AutoProcessor",
-        }
-        (tmp_path / "preprocessor_config.json").write_text(json.dumps(preprocessor_config))
-
-        assert detect_model_type(tmp_path) == "vlm"
-
-    def test_detect_vlm_via_vision_config(self, tmp_path):
-        """Test VLM detection via config.json.vision_config in model_discovery."""
-        config = {
-            "model_type": "jang_vlm",
-            "vision_config": {"hidden_size": 1024},
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "jang_config.json").write_text(
+            json.dumps({"version": "1.0", "architecture": {"has_vision": True}})
+        )
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "jang_vlm"}))
 
         assert detect_model_type(tmp_path) == "vlm"
 
     def test_detect_text_only_jang_as_llm(self, tmp_path):
-        """Test text-only JANG model (no VLM indicators) is LLM."""
-        config = {
-            "model_type": "jang_llm",
-            "architectures": ["JANGForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "jang_config.json").write_text(
+            json.dumps({"version": "1.0", "architecture": {"has_vision": False}})
+        )
+        (tmp_path / "preprocessor_config.json").write_text(
+            json.dumps({"processor_type": "AutoProcessor"})
+        )
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
 
         assert detect_model_type(tmp_path) == "llm"
 
-    def test_jang_has_vision_takes_precedence(self, tmp_path):
-        """Test jang_config.has_vision takes precedence over other config."""
-        # has_vision=False but preprocessor_config exists
-        jang_config = {
-            "version": "1.0",
-            "architecture": {"has_vision": False},
-        }
-        (tmp_path / "jang_config.json").write_text(json.dumps(jang_config))
-        preprocessor_config = {"processor_type": "AutoProcessor"}
-        (tmp_path / "preprocessor_config.json").write_text(json.dumps(preprocessor_config))
+    def test_detect_vlm_via_preprocessor_only_for_jang(self, tmp_path):
+        (tmp_path / "jjqf_config.json").write_text(json.dumps({"quantization": {"bits": 2}}))
+        (tmp_path / "preprocessor_config.json").write_text(
+            json.dumps({"processor_type": "AutoProcessor"})
+        )
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
 
-        # The jang_config.json.architecture.has_vision is checked first in detect_model_type
-        # But now JANG models always use "jang" engine type regardless of model_type
-        # has_vision=False in jang_config means it's a text-only JANG model
-        assert detect_model_type(tmp_path) == "llm"
+        assert detect_model_type(tmp_path) == "vlm"
 
-
-class TestJANGEngineTypeSelection:
-    """Tests for engine type selection based on JANG VLM detection."""
-
-    def test_jang_vlm_engine_type(self, tmp_path):
-        """Test that JANG VLM models use jang engine type."""
-        jang_config = {
-            "version": "1.0",
-            "architecture": {"has_vision": True},
-        }
-        (tmp_path / "jang_config.json").write_text(json.dumps(jang_config))
-        # Create a minimal weight file for size estimation
-        weight_file = tmp_path / "model-00001-of-00001.safetensors"
-        weight_file.write_bytes(b"dummy")
-
-        from omlx.model_discovery import discover_models
+    def test_discover_jang_vlm_uses_jang_engine(self, tmp_path):
+        model_dir = tmp_path / "qwen3.5-vlm-jang"
+        model_dir.mkdir()
+        (model_dir / "jang_config.json").write_text(
+            json.dumps(
+                {
+                    "format": "jang",
+                    "format_version": "2.0",
+                    "architecture": {"has_vision": True},
+                }
+            )
+        )
+        (model_dir / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
+        (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
 
         models = discover_models(tmp_path)
-        assert len(models) == 1
-        model_id = list(models.keys())[0]
-        assert models[model_id].model_type == "vlm"
-        assert models[model_id].engine_type == "jang"
+        assert models["qwen3.5-vlm-jang"].model_type == "vlm"
+        assert models["qwen3.5-vlm-jang"].engine_type == "jang"
 
-    def test_jang_llm_engine_type(self, tmp_path):
-        """Test that non-JANG LLM models use batched engine type."""
-        config = {
-            "model_type": "jang_llm",
-            "architectures": ["JANGForCausalLM"],
+
+class TestJANGLoader:
+    """Tests for JANGLoader behavior that is exercised in production."""
+
+    def test_is_jang_v2_reads_format_version(self, tmp_path):
+        (tmp_path / "jang_config.json").write_text(
+            json.dumps({"format": "jang", "format_version": "2.0"})
+        )
+
+        loader = JANGLoader(str(tmp_path))
+
+        assert loader._is_jang_v2() is True
+
+    def test_should_use_vlm_loader_when_discovery_detects_vlm(self, tmp_path):
+        (tmp_path / "jang_config.json").write_text(
+            json.dumps({"format": "jang", "format_version": "2.0", "architecture": {}})
+        )
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "mistral3", "vision_config": {"hidden_size": 1024}})
+        )
+
+        loader = JANGLoader(str(tmp_path))
+
+        assert loader._should_use_vlm_loader() is True
+
+    def test_should_not_use_vlm_loader_when_jang_explicitly_says_no_vision(self, tmp_path):
+        (tmp_path / "jang_config.json").write_text(
+            json.dumps({"format": "jang", "format_version": "2.0", "architecture": {"has_vision": False}})
+        )
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": "mistral3", "vision_config": {"hidden_size": 1024}})
+        )
+
+        loader = JANGLoader(str(tmp_path))
+
+        assert loader._should_use_vlm_loader() is False
+
+    @pytest.mark.asyncio
+    async def test_start_skips_nemotron_fixup_for_jang_v2(self, tmp_path):
+        (tmp_path / "jang_config.json").write_text(
+            json.dumps({"format": "jang", "format_version": "2.0"})
+        )
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "nemotron_h",
+                    "architectures": ["NemotronHForCausalLM"],
+                    "hidden_size": 4096,
+                    "num_attention_heads": 32,
+                    "head_dim": 128,
+                    "vocab_size": 131072,
+                }
+            )
+        )
+
+        loader = JANGLoader(str(tmp_path))
+        fake_model = MagicMock()
+        fake_model.config = {"architectures": ["NemotronHForCausalLM"]}
+        fake_engine = MagicMock()
+        fake_engine.engine.start = AsyncMock()
+
+        with patch.object(loader, "_check_jang_tools_available"), patch.object(
+            loader, "_should_use_vlm_loader", return_value=False
+        ), patch(
+            "jang_tools.loader.load_jang_model", return_value=(fake_model, MagicMock())
+        ), patch.object(
+            loader, "_fix_nemotron_h_weights"
+        ) as fixup, patch.object(
+            loader, "_needs_bfloat16", return_value=False
+        ), patch(
+            "omlx.engine_core.AsyncEngineCore", return_value=fake_engine
+        ), patch(
+            "omlx.engine_core.EngineConfig", side_effect=lambda **kwargs: SimpleNamespace(**kwargs)
+        ), patch(
+            "omlx.scheduler.SchedulerConfig", return_value=SimpleNamespace(model_name=None)
+        ):
+            await loader.start()
+
+        fixup.assert_not_called()
+
+    def test_fix_nemotron_h_weights_no_index_is_noop(self, tmp_path):
+        loader = JANGLoader(str(tmp_path))
+        loader._model = MagicMock()
+
+        loader._fix_nemotron_h_weights()
+
+        loader._model.load_weights.assert_not_called()
+
+    def test_fix_nemotron_h_weights_dequantizes_gate_weights(self, tmp_path):
+        loader = JANGLoader(str(tmp_path))
+        loader._model = MagicMock()
+
+        index = {
+            "weight_map": {
+                "backbone.layers.0.mixer.gate.weight": "model-00001-of-00001.safetensors",
+                "backbone.layers.0.mixer.gate.scales": "model-00001-of-00001.safetensors",
+                "backbone.layers.0.mixer.gate.biases": "model-00001-of-00001.safetensors",
+            }
         }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        weight_file = tmp_path / "model-00001-of-00001.safetensors"
-        weight_file.write_bytes(b"dummy")
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
 
-        from omlx.model_discovery import discover_models
+        gate_weight = _FakeArray((2, 32))
+        scales = _FakeArray((2, 1))
+        biases = _FakeArray((2, 1))
+        dequantized = _FakeArray((2, 128))
 
-        models = discover_models(tmp_path)
-        assert len(models) == 1
-        model_id = list(models.keys())[0]
-        assert models[model_id].model_type == "llm"
-        assert models[model_id].engine_type == "batched"
-
-    def test_jang_text_only_engine_type(self, tmp_path):
-        """Test that text-only JANG models (with jang_config.json) use jang engine type."""
-        jang_config = {
-            "version": "1.0",
-            "architecture": {
-                "has_vision": False,
-                "has_moe": True,
-                "has_ssm": False,
+        with patch.object(loader, "_needs_bfloat16", return_value=False), patch(
+            "omlx.engine.jang.mx.load",
+            return_value={
+                "backbone.layers.0.mixer.gate.weight": gate_weight,
+                "backbone.layers.0.mixer.gate.scales": scales,
+                "backbone.layers.0.mixer.gate.biases": biases,
             },
-            "quantization": {
-                "profile": "JANG_2L",
-                "actual_bits": 2.31,
-            },
-        }
-        (tmp_path / "jang_config.json").write_text(json.dumps(jang_config))
-        config = {
-            "model_type": "qwen2_moe",
-            "architectures": ["Qwen2MoeForCausalLM"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        weight_file = tmp_path / "model-00001-of-00001.safetensors"
-        weight_file.write_bytes(b"dummy")
+        ) as mock_load, patch(
+            "omlx.engine.jang.mx.dequantize", return_value=dequantized
+        ) as mock_dequantize, patch(
+            "omlx.engine.jang.mx.float16", "float16"
+        ):
+            loader._fix_nemotron_h_weights()
 
-        from omlx.model_discovery import discover_models
+        mock_load.assert_called_once()
+        mock_dequantize.assert_called_once_with(gate_weight, scales, biases, 128, 8)
+        loader._model.load_weights.assert_called_once_with(
+            [("backbone.layers.0.mixer.gate.weight", dequantized)],
+            strict=False,
+        )
 
-        models = discover_models(tmp_path)
-        assert len(models) == 1
-        model_id = list(models.keys())[0]
-        assert models[model_id].model_type == "llm"
-        assert models[model_id].engine_type == "jang"
+    @pytest.mark.asyncio
+    async def test_generate_uses_engine_and_cleans_output(self):
+        loader = JANGLoader("/tmp/jang-model")
+        loader._loaded = True
+        loader._engine = MagicMock()
+        loader._engine.generate = AsyncMock(
+            return_value=SimpleNamespace(
+                output_text="hello<|end|>",
+                prompt_tokens=11,
+                completion_tokens=7,
+                finish_reason="stop",
+                tool_calls=[],
+                cached_tokens=3,
+            )
+        )
+
+        with patch("omlx.engine.jang.clean_special_tokens", return_value="hello") as clean:
+            output = await loader.generate("prompt", max_tokens=9, temperature=0.2)
+
+        clean.assert_called_once_with("hello<|end|>")
+        assert output.text == "hello"
+        assert output.prompt_tokens == 11
+        assert output.completion_tokens == 7
+        sampling_params = loader._engine.generate.await_args.kwargs["sampling_params"]
+        assert sampling_params.max_tokens == 9
+        assert sampling_params.temperature == 0.2

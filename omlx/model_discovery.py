@@ -23,7 +23,7 @@ from typing import Literal
 logger = logging.getLogger(__name__)
 
 ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "jang", "audio_stt", "audio_tts", "audio_sts"]
 
 # JANG model config file names
 JANG_CONFIG_FILES = ("jang_config.json", "jjqf_config.json", "jang_cfg.json")
@@ -313,17 +313,37 @@ def _is_causal_lm_embedding(model_path: Path) -> bool:
     return "embedding" in name_lower or "embed" in name_lower
 
 
+def _get_jang_has_vision(model_path: Path) -> bool | None:
+    """Read `architecture.has_vision` from a JANG config file if present."""
+    for cfg_name in JANG_CONFIG_FILES:
+        jang_config_path = model_path / cfg_name
+        if not jang_config_path.exists():
+            continue
+
+        try:
+            with open(jang_config_path) as f:
+                jang_config = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+
+        architecture = jang_config.get("architecture", {})
+        has_vision = architecture.get("has_vision") if isinstance(architecture, dict) else None
+        return has_vision if isinstance(has_vision, bool) else None
+
+    return None
+
+
 def detect_model_type(model_path: Path) -> ModelType:
     """
     Detect model type from config.json.
 
     Checks:
-    1. JANG VLM indicators: jang_config.json.architecture.has_vision, preprocessor_config.json
-    2. JANG models with JANG config files take priority (mixed-precision)
+    1. Explicit JANG vision metadata via `architecture.has_vision`
+    2. JANG-specific VLM fallback via `preprocessor_config.json`
     3. architectures field for reranker-specific classes (SequenceClassification)
     4. architectures field for embedding-specific classes
     5. model_type field against known embedding types (unambiguous only)
-    6. VLM detection via architectures, model_type, or vision_config presence
+    6. VLM detection via architectures, model_type, or `vision_config`
 
     Args:
         model_path: Path to model directory
@@ -331,27 +351,11 @@ def detect_model_type(model_path: Path) -> ModelType:
     Returns:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
     """
-    # JANG models with config files should use the JANG loader for mixed-precision
-    # Check for JANG config files first
-    jang_config_path = model_path / "jang_config.json"
-    if jang_config_path.exists():
-        try:
-            with open(jang_config_path) as f:
-                jang_config = json.load(f)
-            architecture = jang_config.get("architecture", {})
-            # JANG models use mixed-precision; use jang engine type
-            # Determine model type based on has_vision, but return type used for engine selection
-            has_vision = isinstance(architecture, dict) and architecture.get("has_vision") is True
-            return "vlm" if has_vision else "llm"
-        except (json.JSONDecodeError, IOError):
-            pass
+    is_jang = _is_jang_model(model_path)
+    jang_has_vision = _get_jang_has_vision(model_path)
+    if jang_has_vision is not None:
+        return "vlm" if jang_has_vision else "llm"
 
-    # Check 2: preprocessor_config.json existence (VLM indicator)
-    preprocessor_path = model_path / "preprocessor_config.json"
-    if preprocessor_path.exists():
-        return "vlm"
-
-    # Check 3: config.json.vision_config (existing MLX pattern, fallback)
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -362,8 +366,7 @@ def detect_model_type(model_path: Path) -> ModelType:
     except (json.JSONDecodeError, IOError):
         return "llm"
 
-    # Check for vision_config in config.json
-    if "vision_config" in config:
+    if is_jang and (model_path / "preprocessor_config.json").exists():
         return "vlm"
 
     # Check architectures field for reranker first (more specific)
@@ -432,8 +435,6 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: presence of vision_config (fallback heuristic)
     # Catch-all for VLMs that aren't yet listed in VLM_MODEL_TYPES.
-    # Note: This was already checked earlier, but we keep it here for non-JANG models
-    # that may have config.json without vision_config in the early path.
     if "vision_config" in config:
         return "vlm"
 

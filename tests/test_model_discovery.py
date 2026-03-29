@@ -161,6 +161,19 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
+    def test_non_jang_preprocessor_config_does_not_force_vlm(self, tmp_path):
+        """preprocessor_config.json alone should not reclassify non-JANG models."""
+        config = {
+            "model_type": "bert",
+            "architectures": ["BertModel"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        (tmp_path / "preprocessor_config.json").write_text(
+            json.dumps({"processor_type": "AutoProcessor"})
+        )
+
+        assert detect_model_type(tmp_path) == "embedding"
+
     def test_detect_vlm_gemma3(self, tmp_path):
         """Test detection of Gemma3 as VLM."""
         config = {

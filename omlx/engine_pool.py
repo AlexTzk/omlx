@@ -18,7 +18,7 @@ import gc
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .model_settings import ModelSettingsManager
@@ -40,7 +40,13 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
 )
-from .model_discovery import DiscoveredModel, discover_models, format_size
+from .model_discovery import (
+    DiscoveredModel,
+    EngineType as DiscoveredEngineType,
+    ModelType as DiscoveredModelType,
+    discover_models,
+    format_size,
+)
 from .engine_core import get_mlx_executor
 from .scheduler import SchedulerConfig
 
@@ -53,8 +59,8 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    model_type: DiscoveredModelType  # Model type
+    engine_type: DiscoveredEngineType  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
@@ -514,25 +520,25 @@ class EnginePool:
             elif entry.engine_type == "reranker":
                 # RerankerEngine for reranker models
                 engine = RerankerEngine(model_name=entry.model_path)
-            elif entry.engine_type == "jang":
+            elif effective_type == "jang":
                 # JANGLoader for JANG quantized models
                 engine = JANGLoader(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
                     model_settings=model_settings,
                 )
-            elif entry.engine_type == "vlm":
+            elif effective_type == "vlm":
                 # VLMBatchedEngine for vision-language models
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
                     model_settings=model_settings,
                 )
-            elif entry.engine_type == "audio_stt":
+            elif effective_type == "audio_stt":
                 engine = STTEngine(model_name=entry.model_path)
-            elif entry.engine_type == "audio_tts":
+            elif effective_type == "audio_tts":
                 engine = TTSEngine(model_name=entry.model_path)
-            elif entry.engine_type == "audio_sts":
+            elif effective_type == "audio_sts":
                 engine = STSEngine(
                     model_name=entry.model_path,
                     config_model_type=entry.config_model_type,
@@ -548,7 +554,7 @@ class EnginePool:
             try:
                 await engine.start()
             except Exception as start_error:
-                if entry.engine_type == "vlm":
+                if effective_type == "vlm":
                     # VLM loading failed — fall back to LLM (BatchedEngine)
                     logger.warning(
                         f"VLM loading failed for {model_id}, "

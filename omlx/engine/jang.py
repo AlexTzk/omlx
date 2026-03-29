@@ -18,6 +18,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..model_discovery import detect_model_type
 from ..models.vlm import VLMModelAdapter
 from .base import BaseEngine, GenerationOutput
 
@@ -196,6 +197,44 @@ class JANGLoader(BaseEngine):
             logger.debug(f"Error checking bfloat16 requirements: {e}")
         return False
 
+    def _is_jang_v2(self) -> bool:
+        """Return True when the model uses the JANG v2 format."""
+        model_path = Path(self._model_name)
+        for config_name in ("jang_config.json", "jjqf_config.json", "jang_cfg.json"):
+            config_path = model_path / config_name
+            if not config_path.exists():
+                continue
+            try:
+                with open(config_path) as f:
+                    version = str(json.load(f).get("format_version", "1.0"))
+                return int(version.split(".")[0]) >= 2
+            except Exception:
+                return False
+        return False
+
+    def _get_jang_has_vision(self) -> bool | None:
+        """Return explicit has_vision metadata from JANG config when present."""
+        model_path = Path(self._model_name)
+        for config_name in ("jang_config.json", "jjqf_config.json", "jang_cfg.json"):
+            config_path = model_path / config_name
+            if not config_path.exists():
+                continue
+            try:
+                with open(config_path) as f:
+                    architecture = json.load(f).get("architecture", {})
+            except Exception:
+                return None
+            has_vision = architecture.get("has_vision") if isinstance(architecture, dict) else None
+            return has_vision if isinstance(has_vision, bool) else None
+        return None
+
+    def _should_use_vlm_loader(self) -> bool:
+        """Choose the JANG loader path, trusting shared discovery rules."""
+        explicit_has_vision = self._get_jang_has_vision()
+        if explicit_has_vision is not None:
+            return explicit_has_vision
+        return detect_model_type(Path(self._model_name)) == "vlm"
+
     def _fix_nemotron_h_weights(self) -> None:
         """Fix Nemotron-H weights after JANG loading.
 
@@ -305,73 +344,6 @@ class JANGLoader(BaseEngine):
 
         logger.info("Nemotron-H: weight fixup complete")
 
-
-
-    def _is_vlm_model(self) -> bool:
-        """Check if this is a VLM model.
-
-        Checks (in order):
-        1. jang_config.json.architecture.has_vision (primary JANG metadata)
-        2. preprocessor_config.json existence (VLM indicator)
-        3. config.json.vision_config (existing MLX pattern)
-        4. Model config for vision_config or VLM architectures (after load)
-        """
-        model_path = Path(self._model_name)
-
-        # Check 1: JANG config architecture.has_vision (primary JANG metadata)
-        try:
-            for cfg_name in ("jang_config.json", "jjqf_config.json", "jang_cfg.json"):
-                jang_config_path = model_path / cfg_name
-                if jang_config_path.exists():
-                    with open(jang_config_path) as f:
-                        jang_config = json.load(f)
-                    architecture = jang_config.get("architecture", {})
-                    if isinstance(architecture, dict) and architecture.get("has_vision") is True:
-                        return True
-                    break  # Found JANG config, no need to check others
-        except Exception:
-            pass
-
-        # Check 2: preprocessor_config.json existence (VLM indicator)
-        try:
-            preprocessor_path = model_path / "preprocessor_config.json"
-            if preprocessor_path.exists():
-                return True
-        except Exception:
-            pass
-
-        # Check 3: config.json.vision_config (existing MLX pattern, fallback)
-        try:
-            config_path = model_path / "config.json"
-            if config_path.exists():
-                with open(config_path) as f:
-                    config = json.load(f)
-                if "vision_config" in config:
-                    return True
-                # Also check architectures for VLM hints
-                arch = config.get("architectures", [])
-                for a in arch:
-                    if "VLM" in a or "VL" in a or "Vision" in a:
-                        return True
-        except Exception:
-            pass
-
-        # Check 4: Model config (after load)
-        if self._model is not None:
-            try:
-                config = getattr(self._model, 'config', {})
-                if isinstance(config, dict):
-                    if "vision_config" in config:
-                        return True
-                    arch = config.get("architectures", [])
-                    for a in arch:
-                        if "VLM" in a or "VL" in a or "Vision" in a:
-                            return True
-            except Exception:
-                pass
-
-        return False
-
     async def start(self) -> None:
         """Start the engine (load JANG model if not loaded)."""
         if self._loaded:
@@ -383,7 +355,8 @@ class JANGLoader(BaseEngine):
         # Check jang-tools is available
         self._check_jang_tools_available()
 
-        # Validate that config.json and jang_config.json are consistent
+        # Read config for lightweight diagnostics only. Some architectures
+        # legitimately use attention widths that differ from hidden_size.
         model_path = Path(self._model_name)
         config_path = model_path / "config.json"
         try:
@@ -391,53 +364,15 @@ class JANGLoader(BaseEngine):
                 with open(config_path) as f:
                     config = json.load(f)
 
-                # Check for common inconsistencies
                 text_config = config.get("text_config", config)
-
-                # Get hidden_size from text_config
                 hidden_size = text_config.get("hidden_size", 0)
-                num_attention_heads = text_config.get("num_attention_heads", 1)
-                head_dim = text_config.get("head_dim", 0)
-
-                # Verify consistency: hidden_size should equal num_attention_heads * head_dim
-                if hidden_size > 0 and num_attention_heads > 0 and head_dim > 0:
-                    expected_hidden = num_attention_heads * head_dim
-                    if abs(hidden_size - expected_hidden) > 10:  # Allow small tolerance
-                        logger.warning(
-                            f"Potential config inconsistency: hidden_size={hidden_size} "
-                            f"but num_attention_heads={num_attention_heads} * head_dim={head_dim} "
-                            f"= {expected_hidden}. This may cause loading issues."
-                        )
-
-                # Check vocab_size consistency with embed_tokens
                 vocab_size = text_config.get("vocab_size", 0)
                 if vocab_size > 0:
                     logger.debug(f"Model vocab_size: {vocab_size}, hidden_size: {hidden_size}")
         except Exception as e:
             logger.debug(f"Config validation skipped: {e}")
 
-        # Determine model type based on VLM indicators for jang-tools loader selection
-        is_vlm = self._is_vlm_model()
-
-        # Read the full config for jang-tools
-        model_config = None
-        try:
-            if config_path.exists():
-                with open(config_path) as f:
-                    model_config = json.load(f)
-                logger.info(
-                    f"Model config loaded: model_type={model_config.get('model_type')}, "
-                    f"architectures={model_config.get('architectures')}"
-                )
-                if "text_config" in model_config:
-                    tc = model_config["text_config"]
-                    logger.info(
-                        f"text_config: hidden_size={tc.get('hidden_size')}, "
-                        f"vocab_size={tc.get('vocab_size')}, "
-                        f"num_hidden_layers={tc.get('num_hidden_layers')}"
-                    )
-        except Exception as e:
-            logger.debug(f"Could not read full config: {e}")
+        is_vlm = self._should_use_vlm_loader()
 
         try:
             import jang_tools
@@ -471,8 +406,8 @@ class JANGLoader(BaseEngine):
                         "token counting may fail"
                     )
 
-            # Apply Nemotron-H weight fixups before any dtype changes
-            if self._detect_nemotron_h():
+            # jang-tools already handles Nemotron-H repair in the v2 path.
+            if self._detect_nemotron_h() and not self._is_jang_v2():
                 logger.info("Detected Nemotron-H architecture, applying weight fixups")
                 self._fix_nemotron_h_weights()
 
